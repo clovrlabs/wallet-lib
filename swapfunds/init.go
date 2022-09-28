@@ -56,6 +56,8 @@ func NewService(
 		chainParams = &chaincfg.SimNetParams
 	case "mainnet":
 		chainParams = &chaincfg.MainNetParams
+	case "regtest":
+		chainParams = &chaincfg.RegressionNetParams
 	}
 
 	return &Service{

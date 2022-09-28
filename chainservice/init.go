@@ -155,6 +155,8 @@ func ChainParams(network string) (*chaincfg.Params, error) {
 		params = &chaincfg.SimNetParams
 	case "mainnet":
 		params = &chaincfg.MainNetParams
+	case "regtest":
+		params = &chaincfg.RegressionNetParams
 	}
 
 	if params == nil {

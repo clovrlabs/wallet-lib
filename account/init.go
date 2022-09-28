@@ -74,6 +74,8 @@ func NewService(
 		activeParams = &chaincfg.SimNetParams
 	} else if cfg.Network == "mainnet" {
 		activeParams = &chaincfg.MainNetParams
+	} else if cfg.Network == "regtest" {
+		activeParams = &chaincfg.RegressionNetParams
 	} else {
 		return nil, fmt.Errorf("unknown network type: %v", cfg.Network)
 	}

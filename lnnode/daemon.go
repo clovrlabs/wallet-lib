@@ -297,6 +297,8 @@ func (d *Daemon) createConfig(workingDir string, interceptor signal.Interceptor)
 		lndConfig.Bitcoin.MainNet = true
 	} else if d.cfg.Network == "testnet" {
 		lndConfig.Bitcoin.TestNet3 = true
+	} else if d.cfg.Network == "regtest" {
+		lndConfig.Bitcoin.RegTest = true
 	} else {
 		lndConfig.Bitcoin.SimNet = true
 	}

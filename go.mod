@@ -5,7 +5,7 @@ go 1.19
 require (
 	github.com/breez/boltz v0.0.0-20220719050749-9af40a046ccc
 	github.com/breez/lspd v0.0.0-20220717150558-89212aa5ae59
-	github.com/btcsuite/btcd v0.23.2
+	github.com/btcsuite/btcd v0.23.3
 	github.com/btcsuite/btcd/btcec/v2 v2.2.1
 	github.com/btcsuite/btcd/btcutil v1.1.2
 	github.com/btcsuite/btcd/chaincfg/chainhash v1.0.1
