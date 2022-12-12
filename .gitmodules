@@ -1,4 +1,4 @@
 [submodule "neutrino"]
 	path = neutrino
-	url = https://github.com/Clovr-Labs/neutrino
+	url = https://github.com/clovrlabs/neutrino
 	branch = clovrwallet-develop
