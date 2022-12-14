@@ -2,3 +2,7 @@
 	path = neutrino
 	url = https://github.com/clovrlabs/neutrino
 	branch = clovrwallet-develop
+[submodule "boltz"]
+	path = boltz
+	url = https://github.com/clovrlabs/wallet-boltz.git
+	branch = clovrwallet-develop

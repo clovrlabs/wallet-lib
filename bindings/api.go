@@ -114,6 +114,12 @@ func getBreezApp() *breez.App {
 	return breezApp
 }
 
+func GetBreezApp() *breez.App {
+	mu.Lock()
+	defer mu.Unlock()
+	return breezApp
+}
+
 /*
 Init initialize lightning client
 */
