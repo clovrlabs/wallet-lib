@@ -140,7 +140,12 @@ Init initialize lightning client
 func Init(tempDir string, workingDir string, services AppServices) (err error) {
 	os.Setenv("TMPDIR", tempDir)
 	appServices = services
-	logs = os.Getenv("EnableLogging") == "true"
+	variable, found := os.LookupEnv("EnableLogging")
+	if found {
+		logs = variable == "true"
+	} else {
+		logs = false
+	}
 
 	appLogger, err = GetLogger(workingDir)
 	if err != nil || appLogger == nil {
