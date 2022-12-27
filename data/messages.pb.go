@@ -146,6 +146,7 @@ const (
 	NotificationEvent_REVERSE_SWAP_CLAIM_FAILED    NotificationEvent_NotificationType = 17
 	NotificationEvent_REVERSE_SWAP_CLAIM_CONFIRMED NotificationEvent_NotificationType = 18
 	NotificationEvent_LSP_CHANNEL_OPENED           NotificationEvent_NotificationType = 19
+	NotificationEvent_INFO						   NotificationEvent_NotificationType = 20
 )
 
 var NotificationEvent_NotificationType_name = map[int32]string{
@@ -169,6 +170,7 @@ var NotificationEvent_NotificationType_name = map[int32]string{
 	17: "REVERSE_SWAP_CLAIM_FAILED",
 	18: "REVERSE_SWAP_CLAIM_CONFIRMED",
 	19: "LSP_CHANNEL_OPENED",
+	20: "INFO",
 }
 
 var NotificationEvent_NotificationType_value = map[string]int32{
@@ -192,6 +194,7 @@ var NotificationEvent_NotificationType_value = map[string]int32{
 	"REVERSE_SWAP_CLAIM_FAILED":    17,
 	"REVERSE_SWAP_CLAIM_CONFIRMED": 18,
 	"LSP_CHANNEL_OPENED":           19,
+	"INFO":							20,
 }
 
 func (x NotificationEvent_NotificationType) String() string {
