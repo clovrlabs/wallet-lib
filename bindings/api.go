@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"path"
@@ -40,6 +41,7 @@ var (
 	breezApp    *breez.App
 	appLogger   Logger
 	mu          sync.Mutex
+	logs        bool
 
 	ErrorForceRescan    = fmt.Errorf("Force rescan")
 	ErrorForceBootstrap = fmt.Errorf("Force bootstrap")
@@ -114,10 +116,22 @@ func getBreezApp() *breez.App {
 	return breezApp
 }
 
-func GetBreezApp() *breez.App {
-	mu.Lock()
-	defer mu.Unlock()
-	return breezApp
+func streamStdout(reader *os.File, appServices AppServices) {
+	buf := make([]byte, 6000)
+	for {
+		// read a chunk
+		n, err := reader.Read(buf)
+		if err != nil && err != io.EOF {
+			panic(err)
+		}
+		if n == 0 {
+			continue
+		}
+		notification := data.NotificationEvent{Type: 20, Data: []string{string(buf)}}
+		chann := breezApp.NotificationChan()
+		chann <- notification
+		buf = make([]byte, 6000)
+	}
 }
 
 /*
@@ -126,6 +140,8 @@ Init initialize lightning client
 func Init(tempDir string, workingDir string, services AppServices) (err error) {
 	os.Setenv("TMPDIR", tempDir)
 	appServices = services
+	logs = os.Getenv("EnableLogging") == "true"
+
 	appLogger, err = GetLogger(workingDir)
 	if err != nil || appLogger == nil {
 		fmt.Println("Error in init ", err)
@@ -194,6 +210,13 @@ func Start() error {
 		return err
 	}
 	go deliverNotifications(getBreezApp().NotificationChan(), appServices)
+
+	if logs {
+		r, w, _ := os.Pipe()
+		os.Stdout = w
+		go streamStdout(r, appServices)
+	}
+
 	return nil
 }
 
