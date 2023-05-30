@@ -50,8 +50,12 @@ const (
 	lnurlAuthBucket = "lnurl-auth-bucket"
 
 	//lnurl-pay
-	lnurlPayBucket                  = "lnurl-pay-bucket"
+	lnurlPayBucket = "lnurl-pay-bucket"
+
 	lnurlPayMetadataMigrationBucket = "lnurl-pay-metadata-migration-bucket"
+
+	//Tor
+	torBucket = "tor"
 )
 
 var (
@@ -184,7 +188,16 @@ func openDB(dbPath string, log btclog.Logger) (*DB, error) {
 			return err
 		}
 
+		_, err = tx.CreateBucketIfNotExists([]byte(torBucket))
+		if err != nil {
+			return err
+		}
+
 		_, err = tx.CreateBucketIfNotExists([]byte(lnurlPayMetadataMigrationBucket))
+		if err != nil {
+			return err
+		}
+		_, err = tx.CreateBucketIfNotExists([]byte(torBucket))
 		if err != nil {
 			return err
 		}

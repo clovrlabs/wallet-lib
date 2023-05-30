@@ -3,6 +3,7 @@ package chainservice
 import (
 	"fmt"
 	"io/ioutil"
+	"net"
 	"os"
 	"path"
 	"strconv"
@@ -13,6 +14,7 @@ import (
 	"github.com/breez/breez/db"
 	breezlog "github.com/breez/breez/log"
 	"github.com/breez/breez/refcount"
+	"github.com/breez/breez/tor"
 	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btclog"
@@ -30,6 +32,7 @@ var (
 	service           *neutrino.ChainService
 	walletDB          walletdb.DB
 	logger            btclog.Logger
+	TorConfig         *tor.TorConfig
 )
 
 // Get returned a reusable ChainService
@@ -70,12 +73,59 @@ func TestPeer(peer string) error {
 		return err
 	}
 
-	neutrinoConfig := neutrino.Config{
-		DataDir:      neutrinoDataDir,
-		Database:     db,
-		ChainParams:  chaincfg.MainNetParams,
-		ConnectPeers: []string{peer},
+	var neutrinoConfig neutrino.Config
+
+	// checking we are trying to connect to an onion address
+	splitAddr := strings.Split(peer, ":")
+	if strings.HasSuffix(splitAddr[0], ".onion") {
+
+		// We have to check if tor is active before attemting to connect
+		if TorConfig != nil {
+			logger.Infof("Tor socks:%v", TorConfig.Socks)
+			logger.Infof("Setting up proxy with torconf:%v", TorConfig)
+
+			proxy := TorConfig.NewProxy()
+			logger.Debugf("Setting up proxy: %v", proxy)
+
+			neutrinoConfig = neutrino.Config{
+				DataDir:      neutrinoDataDir,
+				Database:     db,
+				ChainParams:  chaincfg.MainNetParams,
+				ConnectPeers: []string{peer},
+				Dialer: func(addr net.Addr) (net.Conn, error) {
+					return proxy.Dial("onion", addr.String(), time.Second*120)
+				},
+				NameResolver: func(host string) ([]net.IP, error) {
+					addrs, err := proxy.LookupHost(host)
+					if err != nil {
+						return nil, err
+					}
+					ips := make([]net.IP, 0, len(addrs))
+					for _, strIP := range addrs {
+						ip := net.ParseIP(strIP)
+						if ip == nil {
+							continue
+						}
+						ips = append(ips, ip)
+					}
+					return ips, nil
+				},
+			}
+		}
+
+	} else {
+		logger.Info("Tor conf is nil")
+		neutrinoConfig = neutrino.Config{
+			DataDir:      neutrinoDataDir,
+			Database:     db,
+			ChainParams:  chaincfg.MainNetParams,
+			ConnectPeers: []string{peer},
+		}
+		logger.Debugf("neutrino conf %v", neutrinoConfig)
 	}
+
+	logger.Debugf("launcing neutrino with the following config:%v", neutrinoConfig)
+
 	chainService, err := neutrino.NewChainService(neutrinoConfig)
 	if err != nil {
 		logger.Errorf("Error in neutrino.NewChainService: %v", err)
@@ -86,12 +136,14 @@ func TestPeer(peer string) error {
 		logger.Errorf("Error in chainService.Start: %v", err)
 		return err
 	}
+
 	time.Sleep(10 * time.Second)
 	c := chainService.ConnectedCount()
 	if c < 1 {
 		logger.Errorf("chainService.ConnectedCount() returned 0")
-		return fmt.Errorf("Cannot connect to peer")
+		return fmt.Errorf("cannot connect to peer")
 	}
+
 	return nil
 }
 
@@ -121,7 +173,19 @@ func createService(workingDir string, breezDB *db.DB) (*neutrino.ChainService, r
 		return nil, nil, err
 	}
 
-	service, walletDB, err = newNeutrino(workingDir, config, peers)
+	var restPeers []string
+	if !config.JobCfg.DisableRest {
+		for _, p := range peers {
+			for _, dp := range config.JobCfg.ConnectedPeers {
+				if p == dp {
+					logger.Infof("adding %v to restpeers", p, restPeers)
+					restPeers = append(restPeers, "https://"+p)
+				}
+			}
+		}
+	}
+
+	service, walletDB, err = newNeutrino(workingDir, config, peers, restPeers)
 	if err != nil {
 		logger.Errorf("failed to create chain service %v", err)
 		return nil, stopService, err
@@ -144,6 +208,16 @@ func stopService() error {
 		}
 	}
 	return nil
+}
+
+func SetTor(t *tor.TorConfig, active bool) bool {
+	if active && t != nil {
+		logger.Debugf("Setting tor to %v in chainserive, with config:%v", active, t)
+		TorConfig = t
+		return true
+	}
+	TorConfig = nil
+	return false
 }
 
 func ChainParams(network string) (*chaincfg.Params, error) {
@@ -197,9 +271,8 @@ func parseAssertFilterHeader(headerStr string) (*headerfs.FilterHeader, error) {
 newNeutrino creates a chain service that the sync job uses
 in order to fetch chain data such as headers, filters, etc...
 */
-func newNeutrino(workingDir string, cfg *config.Config, peers []string) (*neutrino.ChainService, walletdb.DB, error) {
+func newNeutrino(workingDir string, cfg *config.Config, peers []string, restPeers []string) (*neutrino.ChainService, walletdb.DB, error) {
 	params, err := ChainParams(cfg.Network)
-
 	if err != nil {
 		return nil, nil, err
 	}
@@ -208,13 +281,45 @@ func newNeutrino(workingDir string, cfg *config.Config, peers []string) (*neutri
 
 	neutrinoDataDir, db, err := GetNeutrinoDB(workingDir)
 	if err != nil {
+		logger.Infof("creating new neutrino service failed.")
 		return nil, nil, err
 	}
-	neutrinoConfig := neutrino.Config{
-		DataDir:      neutrinoDataDir,
-		Database:     db,
-		ChainParams:  *params,
-		ConnectPeers: peers,
+	var neutrinoConfig neutrino.Config
+	if TorConfig != nil {
+		proxy := TorConfig.NewProxy()
+		neutrinoConfig = neutrino.Config{
+			DataDir:      neutrinoDataDir,
+			Database:     db,
+			ChainParams:  *params,
+			ConnectPeers: peers,
+			RestPeers:    restPeers,
+			Dialer: func(addr net.Addr) (net.Conn, error) {
+				return proxy.Dial("onion", addr.String(), time.Second*120)
+			},
+			NameResolver: func(host string) ([]net.IP, error) {
+				addrs, err := proxy.LookupHost(host)
+				if err != nil {
+					return nil, err
+				}
+				ips := make([]net.IP, 0, len(addrs))
+				for _, strIP := range addrs {
+					ip := net.ParseIP(strIP)
+					if ip == nil {
+						continue
+					}
+					ips = append(ips, ip)
+				}
+				return ips, nil
+			},
+		}
+	} else {
+		neutrinoConfig = neutrino.Config{
+			DataDir:      neutrinoDataDir,
+			Database:     db,
+			ChainParams:  *params,
+			ConnectPeers: peers,
+			RestPeers:    restPeers,
+		}
 	}
 	logger.Infof("creating new neutrino service.")
 	chainService, err := neutrino.NewChainService(neutrinoConfig)
@@ -232,8 +337,12 @@ func GetNeutrinoDB(workingDir string) (string, walletdb.DB, error) {
 		return "", nil, err
 	}
 
+	fmt.Printf("creating neutrino db at %v", workingDir)
 	db, err := walletdb.Create("bdb", neutrinoDB, false, time.Second*60)
-	fmt.Printf("neutrinoDB err = %v", err)
+	if err != nil {
+		fmt.Printf("error creating neutrino db at %v, failed with %v", neutrinoDB, err)
+		return "", nil, err
+	}
 	return neutrinoDataDir, db, err
 }
 
@@ -261,13 +370,13 @@ func resetChainService(workingDir string) error {
 	}
 	neutrinoDataDir := neutrinoDataDir(workingDir, config.Network)
 	if err = os.Remove(path.Join(neutrinoDataDir, "neutrino.db")); err != nil {
-		logger.Errorf("failed to remove neutrino.db %v", err)
+		fmt.Printf("failed to remove neutrino.db %v", err)
 	}
 	if err = os.Remove(path.Join(neutrinoDataDir, "reg_filter_headers.bin")); err != nil {
-		logger.Errorf("failed to remove reg_filter_headers.bin %v", err)
+		fmt.Printf("failed to remove reg_filter_headers.bin %v", err)
 	}
 	if err = os.Remove(path.Join(neutrinoDataDir, "block_headers.bin")); err != nil {
-		logger.Errorf("failed to remove block_headers.bin %v", err)
+		fmt.Printf("failed to remove block_headers.bin %v", err)
 	}
 
 	return nil

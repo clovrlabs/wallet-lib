@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -12,7 +13,6 @@ import (
 	"net/http"
 	"sort"
 	"strings"
-
 	"time"
 
 	breezservice "github.com/breez/breez/breez"
@@ -20,8 +20,8 @@ import (
 	"github.com/breez/breez/data"
 	"github.com/breez/breez/db"
 
+	lspd "github.com/breez/breez/lspd"
 	"github.com/breez/lspd/btceclegacy"
-	lspd "github.com/breez/lspd/rpc"
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/golang/protobuf/jsonpb"
 	"github.com/golang/protobuf/proto"
@@ -40,6 +40,8 @@ const (
 	defaultInvoiceExpiry       int64 = 3600
 	invoiceCustomPartDelimiter       = " |\n"
 	transferFundsRequest             = "Bitcoin Transfer"
+	waitHtlcsSettledInterval         = time.Millisecond * 20
+	waitHtlcsSettledTimeout          = time.Second * 5
 )
 
 // PaymentResponse is the response of a payment attempt.
@@ -249,9 +251,17 @@ func (a *Service) sendPaymentForRequest(paymentRequest string, amountSatoshi int
 		feeLimit = math.MaxInt64
 	}
 	// At this stage we are ready to send asynchronously the payment through the daemon.
+	var timeoutSeconds int32 = 60
+	if useTor, _ := a.breezDB.GetTorActive(); useTor {
+		/* If Tor is active, extend the timeout to avoid
+		frequent payment timeout failures observed in testing.
+		*/
+		timeoutSeconds *= 2
+	}
+
 	return a.sendPayment(decodedReq.PaymentHash, decodedReq, &routerrpc.SendPaymentRequest{
 		PaymentRequest: paymentRequest,
-		TimeoutSeconds: 60,
+		TimeoutSeconds: timeoutSeconds,
 		FeeLimitSat:    feeLimit,
 		MaxParts:       maxParts,
 		Amt:            amountSatoshi,
@@ -397,18 +407,10 @@ func (a *Service) checkAmount(payReq *lnrpc.PayReq, sendRequest *routerrpc.SendP
 
 func (a *Service) sendPayment(paymentHash string, payReq *lnrpc.PayReq, sendRequest *routerrpc.SendPaymentRequest) (string, error) {
 
-	lnclient := a.daemonAPI.RouterClient()
+	routerclient := a.daemonAPI.RouterClient()
 	if err := a.waitReadyForPayment(); err != nil {
 		a.log.Infof("sendPaymentAsync: error sending payment %v", err)
 		return "", err
-	}
-
-	lspReady, err := a.lspReadyPayment()
-	if err != nil {
-		a.log.Errorf("LSP is not ready for payment: %v", err)
-	}
-	if !lspReady {
-		return "", errors.New("LSP is not ready for payment")
 	}
 
 	if err := a.checkAmount(payReq, sendRequest); err != nil {
@@ -417,7 +419,7 @@ func (a *Service) sendPayment(paymentHash string, payReq *lnrpc.PayReq, sendRequ
 	}
 
 	if payReq != nil && len(payReq.RouteHints) == 1 && len(payReq.RouteHints[0].HopHints) == 1 {
-		lnclient.XImportMissionControl(context.Background(), &routerrpc.XImportMissionControlRequest{
+		routerclient.XImportMissionControl(context.Background(), &routerrpc.XImportMissionControlRequest{
 			Pairs: []*routerrpc.PairHistory{{
 				NodeFrom: []byte(payReq.RouteHints[0].HopHints[0].NodeId),
 				NodeTo:   []byte(payReq.Destination),
@@ -428,15 +430,16 @@ func (a *Service) sendPayment(paymentHash string, payReq *lnrpc.PayReq, sendRequ
 			}}})
 	}
 	a.log.Infof("sending payment with max fee = %v msat", sendRequest.FeeLimitMsat)
-	response, err := lnclient.SendPaymentV2(context.Background(), sendRequest)
+	response, err := routerclient.SendPaymentV2(context.Background(), sendRequest)
 	if err != nil {
 		a.log.Infof("sendPaymentForRequest: error sending payment %v", err)
 		return "", err
 	}
 
 	failureReason := lnrpc.PaymentFailureReason_FAILURE_REASON_NONE
+	var payment *lnrpc.Payment
 	for {
-		payment, err := response.Recv()
+		payment, err = response.Recv()
 		if err != nil {
 			a.log.Infof("Payment event error received %v", err)
 			return "", err
@@ -449,6 +452,48 @@ func (a *Service) sendPayment(paymentHash string, payReq *lnrpc.PayReq, sendRequ
 			failureReason = payment.FailureReason
 		}
 		break
+	}
+
+	paymenthash, err := hex.DecodeString(payment.PaymentHash)
+	if err != nil {
+		a.log.Errorf("Failed to decode payment hash after payment succeeded: %+v", payment)
+		return "", fmt.Errorf("failed to decode payment hash: %w", err)
+	}
+
+	// The payment has completed, but there may still be htlcs that have to be
+	// revoked. Wait for revocation before notifying payment success/failure.
+	lnclient := a.daemonAPI.APIClient()
+	timeout := time.Now().Add(waitHtlcsSettledTimeout)
+out:
+	for {
+		hasPendingHtlcs := false
+		channels, err := lnclient.ListChannels(context.Background(), &lnrpc.ListChannelsRequest{})
+		if err != nil {
+			a.log.Errorf("ListChannels error: %v", err)
+			return "", err
+		}
+
+	retry:
+		for _, c := range channels.Channels {
+			for _, htlc := range c.PendingHtlcs {
+				if bytes.Equal(htlc.HashLock, paymenthash) {
+					a.log.Debugf("HTLC still pending on chan %v. Waiting to finalize.", c.ChanId)
+					hasPendingHtlcs = true
+					break retry
+				}
+			}
+		}
+
+		if !hasPendingHtlcs {
+			break
+		}
+
+		select {
+		case <-time.After(waitHtlcsSettledInterval):
+		case <-time.After(time.Until(timeout)):
+			a.log.Warnf("Timed out waiting for htlcs to finalize. Sending notification anyway.")
+			break out
+		}
 	}
 
 	if failureReason != lnrpc.PaymentFailureReason_FAILURE_REASON_NONE {
@@ -468,7 +513,6 @@ func (a *Service) sendPayment(paymentHash string, payReq *lnrpc.PayReq, sendRequ
 	}
 	a.log.Infof("sendPaymentForRequest finished successfully")
 	a.syncSentPayments()
-	// TODO(@nochiel) FINDOUT Should we notify client here? If we do, what breaks?
 	// a.notifyPaymentResult(true, sendRequest.PaymentRequest, paymentHash, "", "")
 	return "", nil
 }
@@ -522,15 +566,34 @@ func (a *Service) AddInvoice(invoiceRequest *data.AddInvoiceRequest) (paymentReq
 		routingHints = []*lnrpc.RouteHint{fakeHints}
 		a.log.Infof("Generated zero-conf invoice for amount: %v", amountMsat)
 
-		// Calculate the channel fee such that it's an integral number of sat.
-		channelFeesMsat := amountMsat * lspInfo.ChannelFeePermyriad / 10_000 / 1_000 * 1_000
-		if channelFeesMsat < lspInfo.ChannelMinimumFeeMsat {
-			channelFeesMsat = lspInfo.ChannelMinimumFeeMsat
-		}
-		a.log.Infof("zero-conf fee calculation: lsp fee rate (permyriad): %v (minimum %v), total fees for channel: %v",
-			lspInfo.ChannelFeePermyriad, lspInfo.ChannelMinimumFeeMsat, channelFeesMsat)
-		if amountMsat < channelFeesMsat+1000 {
-			return "", 0, fmt.Errorf("amount should be more than the minimum fees (%v sats)", lspInfo.ChannelMinimumFeeMsat/1000)
+		var channelFeesMsat int64
+
+		if invoiceRequest.OpeningFeeParams == nil {
+			// TODO: This branch only exists because there may be existing swaps
+			// that use the old fee rate mechanism. Remove this after those
+			// swaps have expired.
+			channelFeesMsat = amountMsat * lspInfo.ChannelFeePermyriad / 10_000 / 1_000 * 1_000
+			if channelFeesMsat < lspInfo.ChannelMinimumFeeMsat {
+				channelFeesMsat = lspInfo.ChannelMinimumFeeMsat
+			}
+			a.log.Infof("zero-conf fee calculation: lsp fee rate (permyriad): %v (minimum %v), total fees for channel: %v",
+				lspInfo.ChannelFeePermyriad, lspInfo.ChannelMinimumFeeMsat, channelFeesMsat)
+
+			if amountMsat < channelFeesMsat+1000 {
+				return "", 0, fmt.Errorf("amount %v should be more than the minimum fees (%v sats)", amountMsat, lspInfo.ChannelMinimumFeeMsat/1000)
+			}
+		} else {
+			// Calculate the channel fee such that it's an integral number of sat.
+			channelFeesMsat = amountMsat * int64(invoiceRequest.OpeningFeeParams.Proportional) / 1_000_000 / 1_000 * 1_000
+			if channelFeesMsat < int64(invoiceRequest.OpeningFeeParams.MinMsat) {
+				channelFeesMsat = int64(invoiceRequest.OpeningFeeParams.MinMsat)
+			}
+			a.log.Infof("zero-conf fee calculation option: lsp fee rate (proportional): %v (minimum %v), total fees for channel: %v",
+				invoiceRequest.OpeningFeeParams.Proportional, invoiceRequest.OpeningFeeParams.MinMsat, channelFeesMsat)
+
+			if amountMsat < channelFeesMsat+1000 {
+				return "", 0, fmt.Errorf("amount %v should be more than the minimum fees (%v sats)", amountMsat, invoiceRequest.OpeningFeeParams.MinMsat/1000)
+			}
 		}
 
 		smallAmountMsat = amountMsat - channelFeesMsat
@@ -596,7 +659,7 @@ func (a *Service) AddInvoice(invoiceRequest *data.AddInvoiceRequest) (paymentReq
 			return "", 0, fmt.Errorf("failed to fetch zero-conf invoice %w", err)
 		}
 		if existingZeroInvoice == nil || string(existingZeroInvoice) != payeeInvoice {
-			if err := a.registerPayment(payeeInvoiceHash, paymentAddress, amountMsat, smallAmountMsat, pubKey, lspInfo.Id); err != nil {
+			if err := a.registerPayment(payeeInvoiceHash, paymentAddress, amountMsat, smallAmountMsat, pubKey, lspInfo.Id, invoiceRequest.OpeningFeeParams); err != nil {
 				return "", 0, fmt.Errorf("failed to register payment with LSP %w", err)
 			}
 			if err := a.breezDB.AddZeroConfHash(payeeInvoiceHash, []byte(payeeInvoice)); err != nil {
@@ -947,7 +1010,14 @@ func (a *Service) watchPayments() {
 				a.log.Criticalf("Failed to receive an invoice : %v", err)
 				return
 			}
-			if invoice.Settled {
+			if invoice.State == lnrpc.Invoice_SETTLED {
+				err := a.waitHtlcsSettled(ctx, invoice)
+				if err != nil {
+					// NOTE: On error, we'll notify invoice settled anyway.
+					// Not returning here.
+					a.log.Errorf("Failed wait for htlc settlement: %v", err)
+				}
+
 				a.log.Infof("watchPayments adding a received payment")
 				if err = a.onNewReceivedPayment(invoice); err != nil {
 					a.log.Criticalf("Failed to update received payment : %v", err)
@@ -962,6 +1032,76 @@ func (a *Service) watchPayments() {
 		a.log.Infof("Canceling subscription")
 		cancel()
 	}()
+}
+
+func (a *Service) waitHtlcsSettled(ctx context.Context, invoice *lnrpc.Invoice) error {
+	lnclient := a.daemonAPI.APIClient()
+	routerclient := a.daemonAPI.RouterClient()
+
+	subctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	htlcclient, err := routerclient.SubscribeHtlcEvents(
+		subctx,
+		&routerrpc.SubscribeHtlcEventsRequest{},
+	)
+	if err != nil {
+		return err
+	}
+
+	// Get the subscribed event so htlc lookups are reliable.
+	for {
+		ev, err := htlcclient.Recv()
+		if err != nil {
+			return err
+		}
+
+		if ev.GetSubscribedEvent() != nil {
+			break
+		}
+	}
+
+	a.log.Debugf("Invoice %x: lookup state for %v htlcs", invoice.RHash, len(invoice.Htlcs))
+	unsettled := make(map[string]*lnrpc.InvoiceHTLC, len(invoice.Htlcs))
+	for _, h := range invoice.Htlcs {
+		_, err := lnclient.LookupHtlcResolution(subctx, &lnrpc.LookupHtlcResolutionRequest{
+			ChanId:    h.ChanId,
+			HtlcIndex: h.HtlcIndex,
+		})
+
+		if err == nil {
+			// No error means the htlc is finalized (either failed or settled).
+			continue
+		}
+
+		if !strings.Contains(err.Error(), "htlc unknown") {
+			return fmt.Errorf("failed to lookup htlc: %w", err)
+		}
+
+		unsettled[fmt.Sprintf("%vx%v", h.ChanId, h.HtlcIndex)] = h
+	}
+
+	for len(unsettled) > 0 {
+		a.log.Debugf(
+			"Invoice %x: Waiting for htlcs to settle. %v remaining.",
+			invoice.RHash,
+			len(unsettled),
+		)
+		h, err := htlcclient.Recv()
+		if err != nil {
+			return fmt.Errorf("htlcclient.Recv(): %w", err)
+		}
+
+		f := h.GetFinalHtlcEvent()
+		if f == nil {
+			continue
+		}
+
+		delete(unsettled, fmt.Sprintf("%vx%v", h.IncomingChannelId, h.IncomingHtlcId))
+	}
+
+	a.log.Debugf("Invoice %x: All htlcs settled.", invoice.RHash)
+	return nil
 }
 
 func (a *Service) syncSentPayments() error {
@@ -1347,12 +1487,33 @@ func (a *Service) onNewReceivedPayment(invoice *lnrpc.Invoice) error {
 }
 
 func (a *Service) registerPayment(paymentHash, paymentSecret []byte, incomingAmountMsat,
-	outgoingAmountMsat int64, lspPubkey []byte, lspID string) error {
+	outgoingAmountMsat int64, lspPubkey []byte, lspID string, params *data.OpeningFeeParams) error {
 
 	destination, err := hex.DecodeString(a.daemonAPI.NodePubkey())
 	if err != nil {
 		a.log.Infof("hex.DecodeString(%v) error: %v", a.daemonAPI.NodePubkey(), err)
 		return fmt.Errorf("hex.DecodeString(%v) error: %w", a.daemonAPI.NodePubkey(), err)
+	}
+	tag, err := a.generateTag()
+	if err != nil {
+		a.log.Infof("generateTag() error: %v", err)
+		return fmt.Errorf("generateTag() error: %w", err)
+	}
+
+	var p *lspd.OpeningFeeParams
+
+	// TODO: This nil check can be removed once all branches use the
+	// opening_fee_params flow. This only exists because some swaps may use the
+	// old fee structure.
+	if params != nil {
+		p = &lspd.OpeningFeeParams{
+			MinMsat:              params.MinMsat,
+			Proportional:         params.Proportional,
+			ValidUntil:           params.ValidUntil,
+			MaxIdleTime:          params.MaxIdleTime,
+			MaxClientToSelfDelay: params.MaxClientToSelfDelay,
+			Promise:              params.Promise,
+		}
 	}
 	pi := &lspd.PaymentInformation{
 		PaymentHash:        paymentHash,
@@ -1360,6 +1521,8 @@ func (a *Service) registerPayment(paymentHash, paymentSecret []byte, incomingAmo
 		Destination:        destination,
 		IncomingAmountMsat: incomingAmountMsat,
 		OutgoingAmountMsat: outgoingAmountMsat,
+		Tag:                tag,
+		OpeningFeeParams:   p,
 	}
 	data, err := proto.Marshal(pi)
 
@@ -1384,4 +1547,19 @@ func (a *Service) registerPayment(paymentHash, paymentSecret []byte, incomingAmo
 		return fmt.Errorf("RegisterPayment() error: %w", err)
 	}
 	return nil
+}
+
+func (a *Service) generateTag() (string, error) {
+	h := sha256.Sum256([]byte(a.cfg.LspToken))
+	k := hex.EncodeToString(h[:])
+	obj := map[string]interface{}{
+		"apiKeyHash": k,
+	}
+
+	tag, err := json.Marshal(obj)
+	if err != nil {
+		return "", err
+	}
+
+	return string(tag), nil
 }

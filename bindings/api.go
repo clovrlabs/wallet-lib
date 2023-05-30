@@ -25,8 +25,10 @@ import (
 	"github.com/breez/breez/lnnode"
 	breezlog "github.com/breez/breez/log"
 	breezSync "github.com/breez/breez/sync"
+	"github.com/breez/breez/tor"
 	"github.com/btcsuite/btclog"
 	"github.com/golang/protobuf/proto"
+	"github.com/lightningnetwork/lnd/kvdb"
 	"github.com/lightningnetwork/lnd/lnrpc"
 )
 
@@ -37,11 +39,11 @@ const (
 )
 
 var (
-	appServices AppServices
-	breezApp    *breez.App
-	appLogger   Logger
-	mu          sync.Mutex
-	logs        bool
+	appServices   AppServices
+	breezApp      *breez.App
+	appLogger     Logger
+	cachedLSPList *data.LSPList
+	mu            sync.Mutex
 
 	ErrorForceRescan    = fmt.Errorf("Force rescan")
 	ErrorForceBootstrap = fmt.Errorf("Force bootstrap")
@@ -182,6 +184,18 @@ func Init(tempDir string, workingDir string, services AppServices) (err error) {
 				appLogger.Log(fmt.Sprintf("Removed file: %v result: %v", forceBootstrap, err), "INFO")
 			}
 		}
+
+		// drop last sweeper tx
+		db, close, _ := channeldbservice.Get(workingDir)
+		defer close()
+		err := kvdb.Update(db.Backend, func(tx kvdb.RwTx) error {
+			b := tx.ReadWriteBucket([]byte("sweeper-last-tx"))
+			return b.Delete([]byte("last-tx"))
+		}, func() {})
+		if err != nil {
+			fmt.Printf("failed to drop last sweeper tx: %v", err)
+			return err
+		}
 	}
 	mu.Lock()
 	breezApp, err = breez.NewApp(workingDir, services, startBeforeSync)
@@ -209,8 +223,14 @@ func SetBackupEncryptionKey(key []byte, encryptionType string) error {
 /*
 Start the lightning client
 */
-func Start() error {
-	err := getBreezApp().Start()
+func Start(torConfig []byte) error {
+	_torConfig := &data.TorConfig{}
+	if err := proto.Unmarshal(torConfig, _torConfig); err != nil {
+		return err
+	}
+
+	Log(fmt.Sprintf("api.go: Start: _torConfig: %+v", *_torConfig), "INFO")
+	err := getBreezApp().Start(_torConfig)
 	if err != nil {
 		return err
 	}
@@ -347,16 +367,31 @@ func RestoreBackup(nodeID string, encryptionKey []byte) (err error) {
 AvailableSnapshots is part of the binding inteface which is delegated to breez.AvailableSnapshots
 */
 func AvailableSnapshots() (string, error) {
+	Log("Calling Availible Snapshots", "INFO")
 	snapshots, err := getBreezApp().BackupManager.AvailableSnapshots()
 	if err != nil {
-		Log("error in calling AvailableSnapshots: "+err.Error(), "INFO")
+		Log("error in calling AvailableSnapshots: %v"+err.Error(), "INFO")
 		return "", err
+	}
+	if len(snapshots) < 1 {
+		return "", errors.New("empty")
 	}
 	bytes, err := json.Marshal(snapshots)
 	if err != nil {
 		return "", err
 	}
+
 	return string(bytes), nil
+}
+
+func TestBackupAuth(provider, authData string) error {
+	manager := getBreezApp().BackupManager
+	if err := manager.SetBackupProvider(provider, authData); err != nil {
+		return errors.New("Failed to set backup provider.")
+	}
+	p := manager.GetProvider()
+	Log(fmt.Sprintf("manager provider is: %v", p), "INFO")
+	return p.TestAuth()
 }
 
 /*
@@ -413,7 +448,7 @@ func AddFundsInit(initRequest []byte) ([]byte, error) {
 		return nil, err
 	}
 	return marshalResponse(getBreezApp().SwapService.AddFundsInit(
-		request.NotificationToken, request.LspID))
+		request.NotificationToken, request.LspID, request.OpeningFeeParams))
 }
 
 // RefundFees transfers the funds in address to the user destination address
@@ -701,6 +736,8 @@ func SetPeers(request []byte) error {
 }
 
 func TestPeer(peer string) error {
+
+	Log(fmt.Sprintf("api.go: TestPeer: %+v", peer), "INFO")
 	return getBreezApp().TestPeer(peer)
 }
 
@@ -764,11 +801,20 @@ func LSPList() ([]byte, error) {
 }
 
 func LSPActivity() ([]byte, error) {
-	lspList, err := getBreezApp().ServicesClient.LSPList()
-	if err != nil {
-		return nil, err
+	var lspList *data.LSPList
+	mu.Lock()
+	lspList = cachedLSPList
+	mu.Unlock()
+	var err error
+	if lspList == nil {
+		lspList, err = getBreezApp().ServicesClient.LSPList()
+		if err != nil {
+			return nil, err
+		}
+		mu.Lock()
+		cachedLSPList = lspList
+		mu.Unlock()
 	}
-
 	return marshalResponse(getBreezApp().AccountService.LSPActivity(lspList))
 }
 
@@ -782,23 +828,6 @@ func ConnectToLSPPeer(id string) error {
 
 func ConnectToLnurl(lnurl string) error {
 	return getBreezApp().AccountService.OpenLnurlChannel(lnurl)
-}
-
-func SyncLSPChannels(request []byte) ([]byte, error) {
-	var s data.SyncLSPChannelsRequest
-	if err := proto.Unmarshal(request, &s); err != nil {
-		return nil, err
-	}
-	return marshalResponse(getBreezApp().SyncLSPChannels(&s))
-}
-
-// unconfirmedChannelsStatus
-func UnconfirmedChannelsStatus(request []byte) ([]byte, error) {
-	var s data.UnconfirmedChannelsStatus
-	if err := proto.Unmarshal(request, &s); err != nil {
-		return nil, err
-	}
-	return marshalResponse(getBreezApp().UnconfirmedChannelsStatus(&s))
 }
 
 func CheckLSPClosedChannelMismatch(request []byte) ([]byte, error) {
@@ -1001,6 +1030,29 @@ func SyncGraphFromFile(sourceFilePath string) error {
 
 func PublishTransaction(tx []byte) error {
 	return getBreezApp().AccountService.PublishTransaction(tx)
+}
+
+func SetTorActive(enable bool) (err error) {
+	return getBreezApp().SetTorActive(enable)
+}
+
+func SetBackupTorConfig(torConfig []byte) error {
+	Log("Calling SetBackupTorConfig on backupmanager", "INFO")
+	_torConfig := &data.TorConfig{}
+	if err := proto.Unmarshal(torConfig, _torConfig); err != nil {
+		return err
+	}
+	config := &tor.TorConfig{
+		Socks:   _torConfig.Socks,
+		Http:    _torConfig.Http,
+		Control: _torConfig.Control,
+	}
+	getBreezApp().BackupManager.SetTorConfig(config)
+	return nil
+}
+
+func GetTorActive() bool {
+	return getBreezApp().GetTorActive()
 }
 
 func deliverNotifications(notificationsChan chan data.NotificationEvent, appServices AppServices) {

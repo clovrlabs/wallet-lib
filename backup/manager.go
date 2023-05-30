@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/breez/breez/data"
+	"github.com/breez/breez/tor"
 )
 
 const backupFileName = "backup.zip"
@@ -256,6 +257,7 @@ func (b *Manager) Start() error {
 		return nil
 	}
 	b.wg.Add(1)
+
 	go func() {
 		defer b.wg.Done()
 
@@ -271,13 +273,10 @@ func (b *Manager) Start() error {
 				var err error
 				var accountName string
 
-				if req.BackupNodeData {
-					b.log.Infof("starting backup node data")
-					if accountName, err = b.processBackupRequest(true); err != nil {
-						b.log.Errorf("failed to process backup request: %v", err)
-						b.notifyBackupFailed(err)
-						continue
-					}
+				if accountName, err = b.processBackupRequest(true); err != nil {
+					b.log.Errorf("failed to process backup request: %v", err)
+					b.notifyBackupFailed(err)
+					continue
 				}
 				if req.BackupAppData {
 					b.log.Infof("starting backup app data")
@@ -546,12 +545,20 @@ func (b *Manager) getBackupIdentifier() (string, error) {
 	return "backup-id-" + hex.EncodeToString(id), nil
 }
 
+func (b *Manager) SetTorConfig(torConfig *tor.TorConfig) {
+	b.torConfig = torConfig
+	if b.provider != nil {
+		b.provider.SetTor(b.torConfig)
+	}
+}
+
 func (b *Manager) SetBackupProvider(providerName, authData string) error {
-	b.log.Infof("setting backup provider %v, authData: %v", providerName, authData)
-	provider, err := createBackupProvider(providerName, b.authService, authData, b.log)
+	b.log.Infof("setting backup provider %v", providerName)
+	provider, err := createBackupProvider(providerName, ProviderFactoryInfo{b.authService, authData, b.log, b.torConfig})
 	if err != nil {
 		return err
 	}
+	provider.SetTor(b.torConfig)
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.provider = provider

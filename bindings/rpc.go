@@ -10,7 +10,9 @@ import (
 	"google.golang.org/grpc"
 )
 
-type RPC struct{}
+type RPC struct {
+	data.UnimplementedBreezAPIServer
+}
 
 func (r *RPC) GetLSPList(ctx context.Context, in *data.LSPListRequest) (
 	*data.LSPList, error) {
@@ -27,7 +29,7 @@ func (r *RPC) ConnectToLSP(ctx context.Context, in *data.ConnectLSPRequest) (
 
 func (r *RPC) AddFundInit(ctx context.Context, in *data.AddFundInitRequest) (
 	*data.AddFundInitReply, error) {
-	return getBreezApp().SwapService.AddFundsInit(in.NotificationToken, in.LspID)
+	return getBreezApp().SwapService.AddFundsInit(in.NotificationToken, in.LspID, in.OpeningFeeParams)
 }
 
 func (r *RPC) GetFundStatus(ctx context.Context, in *data.FundStatusRequest) (

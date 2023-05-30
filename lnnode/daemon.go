@@ -12,6 +12,8 @@ import (
 	"github.com/breez/breez/chainservice"
 	"github.com/breez/breez/channeldbservice"
 	breezlog "github.com/breez/breez/log"
+	"github.com/breez/breez/tor"
+
 	"github.com/dustin/go-humanize"
 	"github.com/jessevdk/go-flags"
 	"github.com/lightningnetwork/lnd"
@@ -271,7 +273,8 @@ func (d *Daemon) startDaemon() error {
 			chainService: chainSevice,
 			readyChan:    readyChan,
 			chanDB:       chanDB}
-		lndConfig, err := d.createConfig(deps.workingDir, interceptor)
+
+		lndConfig, err := d.createConfig(deps.workingDir, d.TorConfig, interceptor)
 		if err != nil {
 			d.log.Errorf("failed to create config %v", err)
 		}
@@ -290,7 +293,7 @@ func (d *Daemon) startDaemon() error {
 	return nil
 }
 
-func (d *Daemon) createConfig(workingDir string, interceptor signal.Interceptor) (*lnd.Config, error) {
+func (d *Daemon) createConfig(workingDir string, torConfig *tor.TorConfig, interceptor signal.Interceptor) (*lnd.Config, error) {
 	lndConfig := lnd.DefaultConfig()
 	lndConfig.Bitcoin.Active = true
 	if d.cfg.Network == "mainnet" {
@@ -310,6 +313,14 @@ func (d *Daemon) createConfig(workingDir string, interceptor signal.Interceptor)
 		d.log.Errorf("Failed to parse config %v", err)
 		return nil, err
 	}
+
+	if torConfig != nil {
+		d.log.Infof("Configuring daemon with Tor settings: %+v.", *torConfig)
+		cfg.Tor.Active = true
+		cfg.Tor.SOCKS = torConfig.Socks
+		cfg.Tor.Control = torConfig.Control
+	}
+
 	if d.startBeforeSync {
 		lndConfig.InitialHeadersSyncDelta = time.Hour * 2
 	}
@@ -323,8 +334,9 @@ func (d *Daemon) createConfig(workingDir string, interceptor signal.Interceptor)
 	cfg.LogWriter = writer
 	cfg.MinBackoff = time.Second * 20
 	cfg.TLSDisableAutofill = true
+	cfg.StoreFinalHtlcResolutions = true
 
-	fileParser := flags.NewParser(&cfg, flags.Default)
+	fileParser := flags.NewParser(&cfg, flags.IgnoreUnknown)
 	err = flags.NewIniParser(fileParser).ParseFile(lndConfig.ConfigFile)
 	if err != nil {
 		return nil, err
@@ -332,7 +344,7 @@ func (d *Daemon) createConfig(workingDir string, interceptor signal.Interceptor)
 
 	// Finally, parse the remaining command line options again to ensure
 	// they take precedence.
-	flagParser := flags.NewParser(&cfg, flags.Default)
+	flagParser := flags.NewParser(&cfg, flags.IgnoreUnknown)
 	if _, err := flagParser.Parse(); err != nil {
 		return nil, err
 	}

@@ -11,6 +11,7 @@ import (
 	"github.com/breez/breez/config"
 	"github.com/breez/breez/db"
 	breezlog "github.com/breez/breez/log"
+	"github.com/breez/breez/tor"
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btclog"
 	"github.com/lightningnetwork/lnd/channeldb"
@@ -71,6 +72,8 @@ type Daemon struct {
 	quitChan            chan struct{}
 	startBeforeSync     bool
 	interceptor         signal.Interceptor
+
+	TorConfig *tor.TorConfig
 }
 
 // NewDaemon is used to create a new daemon that wraps a lightning
@@ -168,7 +171,7 @@ func (a *Daemon) PopulateChannelsGraph() error {
 			// SigBytes:                  msg.Signature.ToSignatureBytes(),
 			ChannelID:                 c.ShortChanID().ToUint64(),
 			LastUpdate:                time.Now(),
-			MessageFlags:              lnwire.ChanUpdateOptionMaxHtlc,
+			MessageFlags:              lnwire.ChanUpdateRequiredMaxHtlc,
 			ChannelFlags:              chanFlags,
 			TimeLockDelta:             uint16(144),
 			MinHTLC:                   c.LocalChanCfg.MinHTLC,
@@ -187,7 +190,7 @@ func (a *Daemon) PopulateChannelsGraph() error {
 			// SigBytes:                  msg.Signature.ToSignatureBytes(),
 			ChannelID:                 c.ShortChanID().ToUint64(),
 			LastUpdate:                time.Now(),
-			MessageFlags:              lnwire.ChanUpdateOptionMaxHtlc,
+			MessageFlags:              lnwire.ChanUpdateRequiredMaxHtlc,
 			ChannelFlags:              chanFlags,
 			TimeLockDelta:             uint16(144),
 			MinHTLC:                   c.LocalChanCfg.MinHTLC,

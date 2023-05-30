@@ -11,7 +11,9 @@ import (
 	"github.com/lightninglabs/neutrino"
 	"github.com/lightninglabs/neutrino/headerfs"
 	"github.com/lightningnetwork/lnd/chainntnfs"
+	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/input"
+	"github.com/lightningnetwork/lnd/lnwire"
 )
 
 // ChannelsWatcher contains all the data that is needed in order to scan several
@@ -20,13 +22,13 @@ import (
 // opened channels funding points, detect a possible closed channel and warn the user if
 // a the channel was ulitirally found.
 type ChannelsWatcher struct {
-	log                     btclog.Logger
-	chainService            *neutrino.ChainService
-	db                      *jobDB
-	quitChan                chan struct{}
-	watchedScripts          []neutrino.InputWithScript
-	firstChannelBlockHeight uint64
-	closedChannelDetected   bool
+	log                      btclog.Logger
+	chainService             *neutrino.ChainService
+	db                       *jobDB
+	quitChan                 chan struct{}
+	watchedScripts           []neutrino.InputWithScript
+	firstChannelBlockHeight  uint64
+	closedChannelBlockHeight int32
 }
 
 // NewChannelsWatcher creates a new ChannelsWatcher.
@@ -54,8 +56,8 @@ func NewChannelsWatcher(
 	var firstChannelBlockHeight uint64
 
 	for _, c := range channels {
-		if c.LocalCommitment.LocalBalance == 0 {
-			log.Infof("Skipping watching channel with zero balance: %v", c.ShortChannelID.String())
+		if c.LocalCommitment.LocalBalance < lnwire.NewMSatFromSatoshis(1000) {
+			log.Infof("Skipping watching channel with less than 1000 sats balance: %v", c.ShortChannelID.String())
 			continue
 		}
 
@@ -78,7 +80,7 @@ func NewChannelsWatcher(
 		channelBlockHeight := uint64(c.ShortChannelID.BlockHeight)
 
 		// query spend hint for channel
-		hintCache, err := chainntnfs.NewHeightHintCache(chainntnfs.CacheConfig{
+		hintCache, err := channeldb.NewHeightHintCache(channeldb.CacheConfig{
 			QueryDisable: false,
 		}, chandb)
 		if err != nil {
@@ -161,7 +163,7 @@ func (b *ChannelsWatcher) Scan(tipHeight uint64) (bool, error) {
 		neutrino.ProgressHandler(func(lastBlock uint32) {
 			// in case we didn't find any closed channels, we update the last
 			// watcher state.
-			if !b.closedChannelDetected && lastBlock%100 == 0 {
+			if b.closedChannelBlockHeight == 0 && lastBlock%100 == 0 {
 				b.db.setChannelsWatcherBlockHeight(uint64(lastBlock))
 			}
 		}),
@@ -172,14 +174,22 @@ func (b *ChannelsWatcher) Scan(tipHeight uint64) (bool, error) {
 	}
 
 	err = <-rescan.Start()
-	if err == nil && !b.closedChannelDetected {
+
+	// We advance the channel watcher next start in case we either didn't find
+	// closed channels or the one we found is more than 144 blocks away from tip.
+	// The main reason is we don't want to notify again for the same range of blocks.
+	shouldNotify := tipHeight-uint64(b.closedChannelBlockHeight) >= 144
+	if err == nil && (b.closedChannelBlockHeight == 0 || shouldNotify) {
 		b.db.setChannelsWatcherBlockHeight(tipHeight)
 	}
-	b.log.Infof("ChannelsWatcher finished: closedChannelDetected=%v err=%v", b.closedChannelDetected, err)
-	return b.closedChannelDetected, err
+
+	b.log.Infof("ChannelsWatcher finished: closedChannelDetected=%v err=%v", b.closedChannelBlockHeight, err)
+	return shouldNotify && b.closedChannelBlockHeight > 0, err
 }
 
 func (b *ChannelsWatcher) onFilteredBlockConnected(height int32, header *wire.BlockHeader,
 	txs []*btcutil.Tx) {
-	b.closedChannelDetected = b.closedChannelDetected || (len(txs) > 0)
+	if (len(txs) > 0) && (b.closedChannelBlockHeight == 0 || height < b.closedChannelBlockHeight) {
+		b.closedChannelBlockHeight = height
+	}
 }
