@@ -28,6 +28,8 @@ func (a *Service) ValidateAddress(address string) error {
 		network = &chaincfg.SimNetParams
 	} else if a.cfg.Network == "mainnet" {
 		network = &chaincfg.MainNetParams
+	} else if a.cfg.Network == "regtest" {
+		network = &chaincfg.RegressionNetParams
 	} else {
 		return errors.New("unknown network type " + a.cfg.Network)
 	}
